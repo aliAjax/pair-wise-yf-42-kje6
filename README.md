@@ -29,13 +29,42 @@ python3 app.py --db ./data.db --port 8308
 ## 主要接口
 
 - `GET /health`：健康检查。
-- `GET /api/<kind>`：按对象类型查询，可用`?status=`过滤。
+- `GET /api/<kind>`：按对象类型查询，可用`?status=`过滤（如`?status=returned`查退回配对）。
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
-- `GET /api/audit`：读取审计记录。
+- `GET /api/audit`：读取审计记录，可用`?action=pedigree_%25`按动作名过滤。
+- `POST /api/imports/pedigree`：导入外部谱系，见下。
+- `GET /api/imports`、`GET /api/imports/<batch_id>/rows`：导入批次与逐行断点明细。
+- `GET /api/conflicts?status=open`：谱系冲突清单（页面同款数据）。
+- `POST /api/conflicts/<id>/resolution`：协调员裁定冲突。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
+
+## 外部谱系对账流程
+
+导入请求体：
+
+```json
+{
+  "batch_id": "partner-zoo-2026-01",
+  "source": "合作园名称",
+  "records": [{"id": "A001", "name": "玲玲", "sex": "female", "sire_id": "S1", "dam_id": "D1"}]
+}
+```
+
+规则：
+
+1. **按动物编号归并**：本园已有该编号则逐头对账；没有则建档并采信外部父母。
+2. **父母说法冲突，两版都留**：冲突写入`pedigree_conflicts`表并在动物档案挂`open_conflicts`，本园血缘不会被覆盖。
+3. **未裁定先不配对**：雌雄任一方存在未裁定冲突时，配对的`approve`直接拒绝。
+4. **协调员逐条裁定**：`decision`取`keep_local`/`take_external`/`custom`（后者带`custom_parents`），仅`coordinator`/`admin`可操作。
+5. **血缘改动后重算**：裁定完成后对所有`proposed`配对重算近交系数，超过红线`0.125`的配对变为`returned`待复核，退回原因写入`return_reason`与`return_history`；**已批准的结论照旧保留**。退回配对可执行`resubmit`回到待批。
+6. **并发确认只放行一次**：`approve`的读取—校验—写入在同一个`BEGIN IMMEDIATE`事务内，两个协调员同时确认时后到者得到`409`。
+7. **断点重试与幂等**：逐行独立事务，坏行标为`error`并记录`failed_line`，同一`batch_id`重发修正后的批次会跳过已完成行、只处理断点；批次完成后重发直接返回原结果，不重复入库。
+
+审计分三条线留痕：动物档案事件（`pedigree_import_created/merged`、`pedigree_conflict_opened/resolved`）、导入批次事件（`pedigree_import_start/failed/complete`）、配对审批事件（`approve`、自动退回`auto_return`）。
+
 
 ## 测试
 

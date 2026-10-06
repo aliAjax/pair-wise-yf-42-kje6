@@ -1,6 +1,5 @@
 import json
 import os
-import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -77,6 +76,7 @@ def create_handler(service, rules, static_dir):
             try:
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
+                query = parse_qs(parsed.query)
                 if parsed.path == "/health":
                     return self._send(200, service.health())
                 if parsed.path == "/":
@@ -84,7 +84,28 @@ def create_handler(service, rules, static_dir):
                     with open(index, "r", encoding="utf-8") as handle:
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
-                    return self._send(200, {"items": service.audit_log()})
+                    action_like = query.get("action", [None])[0]
+                    return self._send(
+                        200,
+                        {"items": service.audit_log(action_like=action_like)},
+                    )
+                if parts == ["api", "conflicts"]:
+                    status = query.get("status", [None])[0]
+                    animal_id = query.get("animal_id", [None])[0]
+                    return self._send(
+                        200,
+                        {"items": service.list_conflicts(status, animal_id)},
+                    )
+                if parts == ["api", "imports"]:
+                    return self._send(200, {"items": service.list_import_batches()})
+                if len(parts) == 4 and parts[:2] == ["api", "imports"]:
+                    if parts[3] == "rows":
+                        status = query.get("status", [None])[0]
+                        return self._send(
+                            200,
+                            {"items": service.list_import_rows(parts[2], status)},
+                        )
+                    raise NotFoundError("not found")
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -92,7 +113,6 @@ def create_handler(service, rules, static_dir):
                         raise NotFoundError("not found")
                     if len(parts) == 3:
                         return self._send(200, service.get(parts[2]))
-                    query = parse_qs(parsed.query)
                     status = query.get("status", [None])[0]
                     return self._send(
                         200,
@@ -107,6 +127,27 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if parts == ["api", "imports", "pedigree"]:
+                    body = self._body()
+                    batch = service.import_pedigree(
+                        actor,
+                        body.get("batch_id"),
+                        body.get("source", "external"),
+                        body.get("records", []),
+                    )
+                    code = 201 if batch["status"] == "completed" else 200
+                    return self._send(code, batch)
+                if len(parts) == 4 and parts[:2] == ["api", "conflicts"] \
+                        and parts[3] == "resolution":
+                    body = self._body()
+                    result = service.resolve_conflict(
+                        actor,
+                        parts[2],
+                        body.get("decision"),
+                        body.get("custom_parents"),
+                        body.get("expected_version"),
+                    )
+                    return self._send(200, result)
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
