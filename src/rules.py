@@ -6,11 +6,44 @@ from .domain import (
     PermissionDenied,
     ValidationError,
 )
+from .repository import utcnow
 
 
 def _validate_animal(actor, data, lookup):
     if data.get("sex") not in ("male", "female", "unknown"):
         raise ValidationError("sex must be male, female or unknown")
+
+
+def _validate_conflict_create(actor, data, lookup):
+    animal_id = data.get("animal_id")
+    if not animal_id:
+        raise ValidationError("conflict requires animal_id")
+    local = data.get("local")
+    external = data.get("external")
+    if not isinstance(local, dict) or not isinstance(external, dict):
+        raise ValidationError("conflict requires local and external parent versions")
+    return {}
+
+
+def _validate_import_create(actor, data, lookup):
+    batch_key = data.get("batch_key")
+    records = data.get("records")
+    if not batch_key:
+        raise ValidationError("import requires batch_key")
+    if not isinstance(records, list) or not records:
+        raise ValidationError("import requires a non-empty records list")
+    return {}
+
+
+def _validate_conflict_adjudicate(actor, entity, data, lookup):
+    choice = data.get("choice")
+    if choice not in ("local", "external"):
+        raise ValidationError("choice must be local or external")
+    return {
+        "choice": choice,
+        "resolved_by": actor.user_id,
+        "resolved_at": utcnow(),
+    }
 
 
 def inbreeding_coefficient(sire, dam):
@@ -22,8 +55,21 @@ def inbreeding_coefficient(sire, dam):
         return 0.0
     if sire_id == dam_id:
         return 0.5
-    if sire.get("sire_id") == dam_id or dam.get("sire_id") == sire_id:
+    sire_data = sire.get("data", sire)
+    dam_data = dam.get("data", dam)
+    if sire_data.get("sire_id") == dam_id or dam_data.get("sire_id") == sire_id:
         return 0.25
+    if (sire_data.get("sire_id") and sire_data.get("dam_id")
+            and sire_data.get("sire_id") == dam_data.get("sire_id")
+            and sire_data.get("dam_id") == dam_data.get("dam_id")):
+        return 0.25
+    if (sire_data.get("sire_id") and sire_data.get("sire_id") == dam_data.get("sire_id")) or \
+       (sire_data.get("dam_id") and sire_data.get("dam_id") == dam_data.get("dam_id")):
+        return 0.125
+    sire_parents = {sire_data.get("sire_id"), sire_data.get("dam_id")} - {None}
+    dam_parents = {dam_data.get("sire_id"), dam_data.get("dam_id")} - {None}
+    if sire_parents & dam_parents:
+        return 0.0625
     return 0.0
 
 
@@ -34,23 +80,37 @@ def _validate_pairing(actor, entity, data, lookup):
         raise ValidationError("pairing requires two existing animals")
     if sire["status"] != "active" or dam["status"] != "active":
         raise ValidationError("pairing animals must be active")
-    if inbreeding_coefficient(sire["data"], dam["data"]) > 0.125:
+    for animal in (sire, dam):
+        conflicts = lookup("conflict", "animal_id", animal["id"]) or []
+        if any(item["status"] == "pending" for item in conflicts):
+            raise ValidationError(
+                "animal %s has unresolved pedigree conflict" % animal["id"]
+            )
+    coeff = inbreeding_coefficient(sire, dam)
+    if coeff > 0.125:
         raise ValidationError("pairing exceeds inbreeding threshold")
-    return {"approved_by": actor.user_id}
+    return {"approved_by": actor.user_id, "inbreeding_coefficient": coeff}
 
 
-CUSTOM_CREATE = {'animal': _validate_animal}
-CUSTOM_TRANSITIONS = {('pairing', 'approve'): _validate_pairing}
+CUSTOM_CREATE = {
+    'animal': _validate_animal,
+    'conflict': _validate_conflict_create,
+    'pedigree_import': _validate_import_create,
+}
+CUSTOM_TRANSITIONS = {
+    ('pairing', 'approve'): _validate_pairing,
+    ('conflict', 'adjudicate'): _validate_conflict_adjudicate,
+}
 
 
 class RuleEngine:
-    ALIASES = {'animals': 'animal', 'pairings': 'pairing', 'transfers': 'transfer'}
-    INITIAL_STATUS = {'animal': 'active', 'pairing': 'proposed', 'transfer': 'planned'}
-    TRANSITIONS = {'animal': {'mark_deceased': (('active',), 'deceased'), 'quarantine_animal': (('active',), 'quarantined'), 'release_quarantine': (('quarantined',), 'active')}, 'pairing': {'approve': (('proposed',), 'approved'), 'reject': (('proposed',), 'rejected'), 'complete': (('approved',), 'completed')}, 'transfer': {'authorize': (('planned',), 'authorized'), 'ship': (('authorized',), 'in_transit'), 'arrive': (('in_transit',), 'completed')}}
-    CREATE_REQUIRED = {'animal': ('name', 'sex'), 'pairing': ('proposed_by',), 'transfer': ('animal_id', 'from_institution', 'to_institution')}
-    ACTION_REQUIRED = {('animal', 'mark_deceased'): ('cause',), ('animal', 'quarantine_animal'): ('reason',), ('pairing', 'approve'): ('sire_id', 'dam_id', 'approvals'), ('pairing', 'reject'): ('reason',), ('pairing', 'complete'): ('offspring_ids',), ('transfer', 'authorize'): ('permit_id',), ('transfer', 'ship'): ('transport_id',), ('transfer', 'arrive'): ('arrival_date',)}
-    CREATE_ROLES = {'animal': ('admin', 'registrar'), 'pairing': ('admin', 'coordinator'), 'transfer': ('admin', 'registrar')}
-    ROLE_ACTIONS = {'mark_deceased': ('admin', 'veterinarian'), 'quarantine_animal': ('admin', 'veterinarian'), 'release_quarantine': ('admin', 'veterinarian'), 'approve': ('admin', 'coordinator'), 'reject': ('admin', 'coordinator'), 'complete': ('admin', 'coordinator'), 'authorize': ('admin', 'registrar'), 'ship': ('admin', 'registrar'), 'arrive': ('admin', 'registrar')}
+    ALIASES = {'animals': 'animal', 'pairings': 'pairing', 'transfers': 'transfer', 'conflicts': 'conflict', 'pedigree-imports': 'pedigree_import'}
+    INITIAL_STATUS = {'animal': 'active', 'pairing': 'proposed', 'transfer': 'planned', 'conflict': 'pending', 'pedigree_import': 'processing'}
+    TRANSITIONS = {'animal': {'mark_deceased': (('active',), 'deceased'), 'quarantine_animal': (('active',), 'quarantined'), 'release_quarantine': (('quarantined',), 'active')}, 'pairing': {'approve': (('proposed',), 'approved'), 'reject': (('proposed',), 'rejected'), 'complete': (('approved',), 'completed'), 'resubmit': (('returned',), 'proposed')}, 'transfer': {'authorize': (('planned',), 'authorized'), 'ship': (('authorized',), 'in_transit'), 'arrive': (('in_transit',), 'completed')}, 'conflict': {'adjudicate': (('pending',), 'adjudicated')}}
+    CREATE_REQUIRED = {'animal': ('name', 'sex'), 'pairing': ('proposed_by',), 'transfer': ('animal_id', 'from_institution', 'to_institution'), 'conflict': ('animal_id', 'local', 'external'), 'pedigree_import': ('batch_key', 'records')}
+    ACTION_REQUIRED = {('animal', 'mark_deceased'): ('cause',), ('animal', 'quarantine_animal'): ('reason',), ('pairing', 'approve'): ('sire_id', 'dam_id', 'approvals'), ('pairing', 'reject'): ('reason',), ('pairing', 'complete'): ('offspring_ids',), ('transfer', 'authorize'): ('permit_id',), ('transfer', 'ship'): ('transport_id',), ('transfer', 'arrive'): ('arrival_date',), ('conflict', 'adjudicate'): ('choice',)}
+    CREATE_ROLES = {'animal': ('admin', 'registrar'), 'pairing': ('admin', 'coordinator'), 'transfer': ('admin', 'registrar'), 'conflict': ('admin', 'registrar'), 'pedigree_import': ('admin', 'registrar')}
+    ROLE_ACTIONS = {'mark_deceased': ('admin', 'veterinarian'), 'quarantine_animal': ('admin', 'veterinarian'), 'release_quarantine': ('admin', 'veterinarian'), 'approve': ('admin', 'coordinator'), 'reject': ('admin', 'coordinator'), 'complete': ('admin', 'coordinator'), 'authorize': ('admin', 'registrar'), 'ship': ('admin', 'registrar'), 'arrive': ('admin', 'registrar'), 'adjudicate': ('admin', 'coordinator'), 'resubmit': ('admin', 'coordinator')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)

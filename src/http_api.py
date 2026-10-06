@@ -138,6 +138,18 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if len(parts) == 2 and parts[0] == "api" and parts[1] == "pedigree-imports":
+                    body = self._body()
+                    batch_key = body.get("batch_key")
+                    records = body.get("records")
+                    if not batch_key:
+                        raise ValidationError("batch_key is required")
+                    if not isinstance(records, list) or not records:
+                        raise ValidationError("records must be a non-empty list")
+                    return self._send(
+                        200,
+                        service.import_pedigree(actor, batch_key, records),
+                    )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")
